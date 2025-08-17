@@ -27,13 +27,19 @@ class AudioAnalyzer:
     def load_audio(self, file_path: str) -> Tuple[np.ndarray, int]:
         """Load audio file and return audio data with sample rate"""
         try:
+            # Load with librosa, keep original sample rate and channels
             audio, sr = librosa.load(file_path, sr=None, mono=False)
+            
             self.sample_rate = sr
             # Calculate hop length for frame rate analysis
             self.hop_length = sr // self.frame_rate
+            
+            print(f"Loaded {file_path}: {audio.shape} at {sr}Hz")
             return audio, sr
         except Exception as e:
             print(f"Error loading audio file {file_path}: {e}")
+            import traceback
+            traceback.print_exc()
             return None, None
     
     def extract_video_audio_tracks(self, video_path: str) -> List[str]:
@@ -85,16 +91,18 @@ class AudioAnalyzer:
     
     def calculate_db_levels(self, audio: np.ndarray) -> np.ndarray:
         """Calculate dB levels for audio frames"""
-        # Ensure mono for analysis
+        # Convert to mono for analysis if stereo
         if len(audio.shape) > 1:
-            audio = np.mean(audio, axis=0)
+            if audio.shape[0] == 2:  # Stereo (channels, samples)
+                audio_mono = np.mean(audio, axis=0)
+            else:  # (samples, channels)
+                audio_mono = np.mean(audio, axis=1)
+        else:
+            audio_mono = audio
             
-        # Calculate RMS energy in overlapping frames
-        frames = librosa.util.frame(audio, frame_length=self.hop_length, 
-                                  hop_length=self.hop_length//2, axis=0)
-        
-        # Calculate RMS for each frame
-        rms = np.sqrt(np.mean(frames**2, axis=0))
+        # Use librosa to calculate RMS with proper framing
+        rms = librosa.feature.rms(y=audio_mono, frame_length=self.hop_length, 
+                                 hop_length=self.hop_length//2)[0]
         
         # Convert to dB (with small epsilon to avoid log(0))
         db_levels = 20 * np.log10(rms + 1e-10)
@@ -192,25 +200,343 @@ class AudioAnalyzer:
                 print(f"Potential overlap at {time_sec:.2f}s "
                       f"(Track1: {track1_db[i]:.1f}dB, Track2: {track2_db[i]:.1f}dB)")
 
+
+class AudioFocusProcessor:
+    """Main processor that implements the audio focus algorithm"""
+    
+    def __init__(self, frame_rate: int = 30, overlap_threshold: float = 5.0):
+        self.analyzer = AudioAnalyzer(frame_rate)
+        self.frame_rate = frame_rate
+        self.overlap_threshold = overlap_threshold  # dB difference for overlap detection
+        
+    def process_tracks(self, audio_files: List[str], output_prefix: str = "focused") -> List[str]:
+        """Process multiple audio tracks to focus on loudest at each moment"""
+        
+        if len(audio_files) < 2:
+            print("Need at least 2 audio tracks for focus processing")
+            return []
+        
+        print(f"\n=== Processing {len(audio_files)} audio tracks ===")
+        
+        # Load all tracks
+        tracks_data = []
+        for i, audio_file in enumerate(audio_files):
+            audio, sr = self.analyzer.load_audio(audio_file)
+            if audio is not None:
+                db_levels = self.analyzer.calculate_db_levels(audio)
+                tracks_data.append({
+                    'audio': audio,
+                    'db_levels': db_levels,
+                    'sample_rate': sr,
+                    'track_num': i + 1
+                })
+                duration = len(audio) / sr if len(audio.shape) == 1 else audio.shape[1] / sr
+                print(f"Loaded track {i+1}: {duration:.2f}s")
+        
+        if len(tracks_data) < 2:
+            print("Failed to load sufficient tracks")
+            return []
+        
+        # Determine focus decisions for each frame
+        focus_decisions = self._calculate_focus_decisions(tracks_data)
+        
+        # Apply focus to each track and save
+        output_files = []
+        for i, track_data in enumerate(tracks_data):
+            focused_audio = self._apply_focus(track_data, focus_decisions, i)
+            
+            # Save focused track
+            output_file = f"{output_prefix}_track_{i+1}.wav"
+            
+            # Ensure proper format for soundfile
+            if len(focused_audio.shape) > 1:
+                # Stereo - transpose to (samples, channels) format
+                focused_audio_out = focused_audio.T
+            else:
+                # Mono
+                focused_audio_out = focused_audio
+            
+            sf.write(output_file, focused_audio_out, track_data['sample_rate'], subtype='PCM_16')
+            output_files.append(output_file)
+            print(f"Saved focused track {i+1} to {output_file}")
+        
+        # Generate focus report
+        self._generate_focus_report(focus_decisions, tracks_data, f"{output_prefix}_report.txt")
+        
+        return output_files
+    
+    def _calculate_focus_decisions(self, tracks_data: List[Dict]) -> List[Dict]:
+        """Calculate which track should be focused at each frame"""
+        
+        # Find the shortest track to avoid index errors
+        min_frames = min(len(track['db_levels']) for track in tracks_data)
+        
+        focus_decisions = []
+        
+        for frame_idx in range(min_frames):
+            frame_db_levels = [track['db_levels'][frame_idx] for track in tracks_data]
+            max_db = max(frame_db_levels)
+            loudest_track = frame_db_levels.index(max_db)
+            
+            # Check for overlaps (multiple tracks with similar levels)
+            overlapping_tracks = []
+            for i, db_level in enumerate(frame_db_levels):
+                if abs(db_level - max_db) <= self.overlap_threshold and db_level > -30:
+                    overlapping_tracks.append(i)
+            
+            # Decide if this is genuine overlap vs mic bleed
+            is_genuine_overlap = self._detect_genuine_overlap(
+                frame_idx, frame_db_levels, tracks_data, overlapping_tracks
+            )
+            
+            decision = {
+                'frame': frame_idx,
+                'time': frame_idx / self.frame_rate,
+                'db_levels': frame_db_levels.copy(),
+                'loudest_track': loudest_track,
+                'active_tracks': overlapping_tracks if is_genuine_overlap else [loudest_track],
+                'is_overlap': is_genuine_overlap and len(overlapping_tracks) > 1
+            }
+            
+            focus_decisions.append(decision)
+        
+        return focus_decisions
+    
+    def _detect_genuine_overlap(self, frame_idx: int, frame_db_levels: List[float], 
+                               tracks_data: List[Dict], overlapping_tracks: List[int]) -> bool:
+        """Detect if overlapping audio is genuine conversation vs mic bleed"""
+        
+        if len(overlapping_tracks) <= 1:
+            return False
+        
+        # Simple heuristic: if multiple tracks are significantly above noise floor
+        # and close in level, it's likely genuine overlap
+        significant_tracks = [i for i, db in enumerate(frame_db_levels) 
+                             if db > -25 and i in overlapping_tracks]
+        
+        # Additional check: look at recent history to see if it's a transition
+        # vs sustained overlap (genuine conversation)
+        window_size = min(10, frame_idx)  # Look back up to 10 frames
+        if window_size > 3:
+            recent_leaders = []
+            for i in range(max(0, frame_idx - window_size), frame_idx):
+                if i < len(tracks_data[0]['db_levels']):
+                    recent_db = [track['db_levels'][i] for track in tracks_data]
+                    recent_leaders.append(recent_db.index(max(recent_db)))
+            
+            # If leadership has been changing recently, more likely genuine overlap
+            leadership_changes = len(set(recent_leaders))
+            
+            return len(significant_tracks) >= 2 and leadership_changes > 1
+        
+        return len(significant_tracks) >= 2
+    
+    def _apply_focus(self, track_data: Dict, focus_decisions: List[Dict], track_index: int) -> np.ndarray:
+        """Apply focus decisions to mute/unmute audio track"""
+        
+        audio = track_data['audio'].copy()
+        sample_rate = track_data['sample_rate']
+        
+        # Convert frame decisions to sample-level decisions
+        samples_per_frame = sample_rate // self.frame_rate
+        
+        for decision in focus_decisions:
+            start_sample = decision['frame'] * samples_per_frame
+            end_sample = min(start_sample + samples_per_frame, len(audio))
+            
+            if track_index not in decision['active_tracks']:
+                # Mute this segment with fade out
+                fade_samples = min(100, (end_sample - start_sample) // 4)  # Quick fade
+                
+                # Fade out at start
+                if fade_samples > 0:
+                    fade_out = np.linspace(1.0, 0.0, fade_samples)
+                    if start_sample + fade_samples <= len(audio):
+                        if len(audio.shape) > 1:  # Stereo
+                            for ch in range(audio.shape[0]):
+                                audio[ch, start_sample:start_sample + fade_samples] *= fade_out
+                        else:  # Mono
+                            audio[start_sample:start_sample + fade_samples] *= fade_out
+                
+                # Mute the rest
+                if len(audio.shape) > 1:  # Stereo
+                    audio[:, start_sample + fade_samples:end_sample] = 0
+                else:  # Mono
+                    audio[start_sample + fade_samples:end_sample] = 0
+        
+        return audio
+    
+    def _generate_focus_report(self, focus_decisions: List[Dict], tracks_data: List[Dict], filename: str):
+        """Generate a report of focus decisions for validation"""
+        
+        with open(filename, 'w') as f:
+            f.write("Audio Focus Report\n")
+            f.write("==================\n\n")
+            
+            f.write(f"Processed {len(tracks_data)} tracks\n")
+            f.write(f"Total frames: {len(focus_decisions)}\n")
+            f.write(f"Frame rate: {self.frame_rate} fps\n")
+            f.write(f"Duration: {len(focus_decisions) / self.frame_rate:.2f} seconds\n\n")
+            
+            # Summary statistics
+            track_focus_time = [0] * len(tracks_data)
+            overlap_count = 0
+            
+            for decision in focus_decisions:
+                if decision['is_overlap']:
+                    overlap_count += 1
+                for track_idx in decision['active_tracks']:
+                    track_focus_time[track_idx] += 1
+            
+            f.write("Focus Time Summary:\n")
+            for i, focus_time in enumerate(track_focus_time):
+                percentage = (focus_time / len(focus_decisions)) * 100
+                f.write(f"Track {i+1}: {focus_time} frames ({percentage:.1f}%)\n")
+            
+            f.write(f"\nOverlap frames: {overlap_count} ({(overlap_count/len(focus_decisions)*100):.1f}%)\n\n")
+            
+            # Detailed timeline (sample every 5 seconds for readability)
+            f.write("Detailed Timeline (every 5 seconds):\n")
+            f.write("Time\tActive Track(s)\tdB Levels\tNotes\n")
+            
+            for i, decision in enumerate(focus_decisions):
+                if i % (self.frame_rate * 5) == 0:  # Every 5 seconds
+                    time_str = f"{decision['time']:.1f}s"
+                    if decision['is_overlap']:
+                        active_str = f"Tracks {','.join(map(str, [t+1 for t in decision['active_tracks']]))}"
+                        notes = "OVERLAP"
+                    else:
+                        active_str = f"Track {decision['loudest_track']+1}"
+                        notes = "FOCUSED"
+                    
+                    db_str = " ".join([f"{db:.1f}" for db in decision['db_levels']])
+                    f.write(f"{time_str}\t{active_str}\t{db_str}\t{notes}\n")
+        
+        print(f"Focus report saved to {filename}")
+
 def main():
-    """Main function for initial testing"""
-    print("Starting audio focus analysis...")
+    """Main function with command-line interface"""
+    parser = argparse.ArgumentParser(description="Audio Focus System - Focus on loudest track at each moment")
     
-    analyzer = AudioAnalyzer()
+    parser.add_argument('inputs', nargs='+', 
+                       help='Input files: either video file (extracts all audio tracks) or multiple audio files')
+    parser.add_argument('--output', '-o', default='focused',
+                       help='Output prefix for generated files (default: focused)')
+    parser.add_argument('--frame-rate', '-f', type=int, default=30,
+                       help='Frame rate for analysis (default: 30)')
+    parser.add_argument('--overlap-threshold', '-t', type=float, default=5.0,
+                       help='dB threshold for overlap detection (default: 5.0)')
+    parser.add_argument('--audio-only', '-a', action='store_true',
+                       help='Output audio files only, even from video input')
+    parser.add_argument('--analyze-only', action='store_true',
+                       help='Only analyze input, don\'t process (for testing)')
     
-    # Test with Dialog.mp4
-    if os.path.exists("Dialog.mp4"):
-        print("Found Dialog.mp4, analyzing...")
-        try:
-            analyzer.analyze_sample_file("Dialog.mp4")
-        except Exception as e:
-            print(f"Error during analysis: {e}")
-            import traceback
-            traceback.print_exc()
-    else:
-        print("Dialog.mp4 not found in current directory")
-        print(f"Current directory: {os.getcwd()}")
-        print(f"Files in directory: {os.listdir('.')}")
+    args = parser.parse_args()
+    
+    print("=== Audio Focus System ===")
+    print(f"Frame rate: {args.frame_rate} fps")
+    print(f"Overlap threshold: {args.overlap_threshold} dB")
+    
+    # Initialize components
+    analyzer = AudioAnalyzer(args.frame_rate)
+    processor = AudioFocusProcessor(args.frame_rate, args.overlap_threshold)
+    
+    try:
+        # Determine input type and extract audio tracks
+        if len(args.inputs) == 1 and args.inputs[0].lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+            # Single video file - extract all audio tracks
+            video_file = args.inputs[0]
+            print(f"Processing video file: {video_file}")
+            
+            if args.analyze_only:
+                analyzer.analyze_sample_file(video_file)
+                return
+            
+            audio_files = analyzer.extract_video_audio_tracks(video_file)
+            if not audio_files:
+                print("Failed to extract audio tracks from video")
+                return
+                
+            is_video_input = True
+            
+        else:
+            # Multiple audio files
+            audio_files = args.inputs
+            print(f"Processing {len(audio_files)} audio files")
+            
+            # Verify all files exist
+            for audio_file in audio_files:
+                if not os.path.exists(audio_file):
+                    print(f"Error: Audio file not found: {audio_file}")
+                    return
+            
+            is_video_input = False
+        
+        # Process the audio tracks
+        output_files = processor.process_tracks(audio_files, args.output)
+        
+        if output_files:
+            print(f"\n=== Processing Complete ===")
+            print(f"Generated {len(output_files)} focused audio tracks:")
+            for output_file in output_files:
+                print(f"  - {output_file}")
+            
+            print(f"Focus report: {args.output}_report.txt")
+            
+            # If input was video and user wants video output (not audio-only)
+            if is_video_input and not args.audio_only:
+                print("\n=== Creating Focused Video ===")
+                video_output = create_focused_video(args.inputs[0], output_files, args.output)
+                if video_output:
+                    print(f"Focused video saved as: {video_output}")
+        
+        # Clean up temporary files
+        if is_video_input:
+            for temp_file in audio_files:
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+    
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def create_focused_video(input_video: str, focused_audio_files: List[str], output_prefix: str) -> Optional[str]:
+    """Create a video with focused audio tracks"""
+    
+    try:
+        output_video = f"{output_prefix}_video.mp4"
+        
+        # Use ffmpeg to combine video with focused audio tracks
+        input_stream = ffmpeg.input(input_video)
+        
+        # Add focused audio tracks
+        audio_streams = []
+        for audio_file in focused_audio_files:
+            audio_streams.append(ffmpeg.input(audio_file))
+        
+        # Map video and audio streams
+        stream_maps = [input_stream.video]  # Keep original video
+        stream_maps.extend(audio_streams)   # Add focused audio tracks
+        
+        # Combine streams
+        output = ffmpeg.output(*stream_maps, output_video, 
+                             vcodec='copy',  # Copy video without re-encoding
+                             acodec='aac',   # Re-encode audio as AAC
+                             audio_bitrate='320k')
+        
+        # Run ffmpeg
+        ffmpeg.run(output, overwrite_output=True, quiet=True)
+        
+        return output_video
+        
+    except Exception as e:
+        print(f"Error creating focused video: {e}")
+        return None
+
 
 if __name__ == "__main__":
     main()
