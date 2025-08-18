@@ -240,10 +240,37 @@ class AudioFocusProcessor:
         # Determine focus decisions for each frame
         focus_decisions = self._calculate_focus_decisions(tracks_data)
         
+        # Show focus summary
+        total_frames = len(focus_decisions)
+        track_active_counts = [0] * len(tracks_data)
+        overlap_count = 0
+        
+        for decision in focus_decisions:
+            if decision['is_overlap']:
+                overlap_count += 1
+            for track_idx in decision['active_tracks']:
+                track_active_counts[track_idx] += 1
+        
+        print(f"\nFocus Summary:")
+        for i, count in enumerate(track_active_counts):
+            percentage = (count / total_frames) * 100
+            print(f"Track {i+1}: {count}/{total_frames} frames ({percentage:.1f}%)")
+        print(f"Overlap frames: {overlap_count}/{total_frames} ({(overlap_count/total_frames)*100:.1f}%)")
+        
         # Apply focus to each track and save
         output_files = []
         for i, track_data in enumerate(tracks_data):
             focused_audio = self._apply_focus(track_data, focus_decisions, i)
+            
+            # Show active audio percentage
+            total_samples = len(focused_audio) if len(focused_audio.shape) == 1 else focused_audio.shape[1]
+            if len(focused_audio.shape) > 1:
+                non_zero_samples = np.count_nonzero(np.any(focused_audio != 0, axis=0))
+            else:
+                non_zero_samples = np.count_nonzero(focused_audio)
+            
+            active_percentage = (non_zero_samples / total_samples) * 100
+            print(f"Track {i+1}: {active_percentage:.1f}% active audio")
             
             # Save focused track
             output_file = f"{output_prefix}_track_{i+1}.wav"
@@ -337,34 +364,62 @@ class AudioFocusProcessor:
         audio = track_data['audio'].copy()
         sample_rate = track_data['sample_rate']
         
+        # Start with completely muted track
+        if len(audio.shape) > 1:  # Stereo
+            focused_audio = np.zeros_like(audio)
+        else:  # Mono
+            focused_audio = np.zeros_like(audio)
+        
         # Convert frame decisions to sample-level decisions
         samples_per_frame = sample_rate // self.frame_rate
         
+        # Calculate samples per frame for processing
+        # Note: track_index is 0-based here, but displayed as 1-based elsewhere
+        
         for decision in focus_decisions:
             start_sample = decision['frame'] * samples_per_frame
-            end_sample = min(start_sample + samples_per_frame, len(audio))
+            end_sample = min(start_sample + samples_per_frame, 
+                           len(audio) if len(audio.shape) == 1 else audio.shape[1])
             
-            if track_index not in decision['active_tracks']:
-                # Mute this segment with fade out
+            if track_index in decision['active_tracks']:
+                # This track is focused - copy original audio with fade in
                 fade_samples = min(100, (end_sample - start_sample) // 4)  # Quick fade
                 
-                # Fade out at start
-                if fade_samples > 0:
-                    fade_out = np.linspace(1.0, 0.0, fade_samples)
-                    if start_sample + fade_samples <= len(audio):
-                        if len(audio.shape) > 1:  # Stereo
-                            for ch in range(audio.shape[0]):
-                                audio[ch, start_sample:start_sample + fade_samples] *= fade_out
-                        else:  # Mono
-                            audio[start_sample:start_sample + fade_samples] *= fade_out
-                
-                # Mute the rest
-                if len(audio.shape) > 1:  # Stereo
-                    audio[:, start_sample + fade_samples:end_sample] = 0
+                if len(audio.shape) > 1:  # Stereo (channels, samples)
+                    # Copy the audio segment
+                    focused_audio[:, start_sample:end_sample] = audio[:, start_sample:end_sample]
+                    
+                    # Apply fade in if this is a transition
+                    if fade_samples > 0 and start_sample > 0:
+                        # Check if previous frame was muted
+                        prev_frame = max(0, decision['frame'] - 1)
+                        if prev_frame < len(focus_decisions):
+                            prev_decision = focus_decisions[prev_frame]
+                            if track_index not in prev_decision['active_tracks']:
+                                # Was muted before, apply fade in
+                                fade_in = np.linspace(0.0, 1.0, fade_samples)
+                                for ch in range(audio.shape[0]):
+                                    if start_sample + fade_samples <= focused_audio.shape[1]:
+                                        focused_audio[ch, start_sample:start_sample + fade_samples] *= fade_in
                 else:  # Mono
-                    audio[start_sample + fade_samples:end_sample] = 0
+                    # Copy the audio segment
+                    focused_audio[start_sample:end_sample] = audio[start_sample:end_sample]
+                    
+                    # Apply fade in if this is a transition
+                    if fade_samples > 0 and start_sample > 0:
+                        # Check if previous frame was muted
+                        prev_frame = max(0, decision['frame'] - 1)
+                        if prev_frame < len(focus_decisions):
+                            prev_decision = focus_decisions[prev_frame]
+                            if track_index not in prev_decision['active_tracks']:
+                                # Was muted before, apply fade in
+                                fade_in = np.linspace(0.0, 1.0, fade_samples)
+                                if start_sample + fade_samples <= len(focused_audio):
+                                    focused_audio[start_sample:start_sample + fade_samples] *= fade_in
+            
+            # If not in active tracks, segment remains muted (zeros)
         
-        return audio
+        return focused_audio
     
     def _generate_focus_report(self, focus_decisions: List[Dict], tracks_data: List[Dict], filename: str):
         """Generate a report of focus decisions for validation"""
@@ -510,31 +565,108 @@ def create_focused_video(input_video: str, focused_audio_files: List[str], outpu
     try:
         output_video = f"{output_prefix}_video.mp4"
         
-        # Use ffmpeg to combine video with focused audio tracks
-        input_stream = ffmpeg.input(input_video)
+        print(f"Creating video with {len(focused_audio_files)} focused audio tracks...")
         
-        # Add focused audio tracks
-        audio_streams = []
+        # Build ffmpeg command more explicitly
+        inputs = [ffmpeg.input(input_video)]
+        
+        # Add each focused audio file as input
         for audio_file in focused_audio_files:
-            audio_streams.append(ffmpeg.input(audio_file))
+            inputs.append(ffmpeg.input(audio_file))
         
-        # Map video and audio streams
-        stream_maps = [input_stream.video]  # Keep original video
-        stream_maps.extend(audio_streams)   # Add focused audio tracks
+        # Create output with explicit mapping
+        # Map video from input 0, and audio tracks from subsequent inputs
+        args = {
+            'vcodec': 'copy',  # Copy video without re-encoding
+            'acodec': 'aac',   # Re-encode audio as AAC
+            'audio_bitrate': '320k',
+            'ar': 48000,       # Set audio sample rate
+            'ac': 2            # Set to stereo
+        }
         
-        # Combine streams
-        output = ffmpeg.output(*stream_maps, output_video, 
-                             vcodec='copy',  # Copy video without re-encoding
-                             acodec='aac',   # Re-encode audio as AAC
-                             audio_bitrate='320k')
+        # Map streams explicitly
+        stream_spec = [inputs[0]['v:0']]  # Video from first input
         
-        # Run ffmpeg
-        ffmpeg.run(output, overwrite_output=True, quiet=True)
+        # Add audio streams from focused audio files
+        for i in range(len(focused_audio_files)):
+            stream_spec.append(inputs[i + 1]['a:0'])
         
-        return output_video
+        # Create output
+        output = ffmpeg.output(*stream_spec, output_video, **args)
+        
+        # Run ffmpeg with verbose output for debugging
+        try:
+            ffmpeg.run(output, overwrite_output=True, capture_stdout=True, capture_stderr=True)
+            print(f"Successfully created {output_video}")
+            return output_video
+            
+        except ffmpeg.Error as e:
+            print(f"FFmpeg error creating video:")
+            print(f"stdout: {e.stdout.decode()}")
+            print(f"stderr: {e.stderr.decode()}")
+            
+            # Try alternative approach with simpler command
+            print("Trying alternative ffmpeg approach...")
+            return create_focused_video_alternative(input_video, focused_audio_files, output_prefix)
         
     except Exception as e:
         print(f"Error creating focused video: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def create_focused_video_alternative(input_video: str, focused_audio_files: List[str], output_prefix: str) -> Optional[str]:
+    """Alternative video creation method using direct ffmpeg command"""
+    
+    try:
+        output_video = f"{output_prefix}_video.mp4"
+        
+        # Build command manually for more control
+        cmd = ['ffmpeg', '-y']  # -y to overwrite output
+        
+        # Add input video
+        cmd.extend(['-i', input_video])
+        
+        # Add input audio files
+        for audio_file in focused_audio_files:
+            cmd.extend(['-i', audio_file])
+        
+        # Map video (copy without re-encoding)
+        cmd.extend(['-map', '0:v:0', '-c:v', 'copy'])
+        
+        # Map and re-encode audio tracks
+        for i in range(len(focused_audio_files)):
+            cmd.extend(['-map', f'{i+1}:a:0'])
+        
+        # Audio encoding settings
+        cmd.extend([
+            '-c:a', 'aac',
+            '-b:a', '320k',
+            '-ar', '48000',
+            '-ac', '2'
+        ])
+        
+        # Output file
+        cmd.append(output_video)
+        
+        print(f"Running command: {' '.join(cmd)}")
+        
+        # Run command
+        import subprocess
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            print(f"Successfully created {output_video}")
+            return output_video
+        else:
+            print(f"FFmpeg command failed:")
+            print(f"stdout: {result.stdout}")
+            print(f"stderr: {result.stderr}")
+            return None
+            
+    except Exception as e:
+        print(f"Error in alternative video creation: {e}")
         return None
 
 
