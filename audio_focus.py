@@ -101,8 +101,9 @@ class AudioAnalyzer:
             audio_mono = audio
             
         # Use librosa to calculate RMS with proper framing
+        # Use hop_length (not hop_length//2) to match frame rate exactly
         rms = librosa.feature.rms(y=audio_mono, frame_length=self.hop_length, 
-                                 hop_length=self.hop_length//2)[0]
+                                 hop_length=self.hop_length)[0]
         
         # Convert to dB (with small epsilon to avoid log(0))
         db_levels = 20 * np.log10(rms + 1e-10)
@@ -257,9 +258,36 @@ class AudioFocusProcessor:
             print(f"Track {i+1}: {count}/{total_frames} frames ({percentage:.1f}%)")
         print(f"Overlap frames: {overlap_count}/{total_frames} ({(overlap_count/total_frames)*100:.1f}%)")
         
+        # Debug: Show some sample decisions to understand what's happening
+        print(f"\nSample Focus Decisions (first 10 frames):")
+        for i in range(min(10, len(focus_decisions))):
+            decision = focus_decisions[i]
+            loudest = decision['loudest_track']
+            active = decision['active_tracks']
+            db_levels = [f"{db:.1f}" for db in decision['db_levels']]
+            print(f"Frame {i}: Loudest=Track{loudest+1}, Active={[t+1 for t in active]}, dB=[{','.join(db_levels)}]")
+        
+        # Debug: Show transitions where focus changes
+        print(f"\nFocus Transitions (first 20):")
+        prev_loudest = -1
+        transition_count = 0
+        for i, decision in enumerate(focus_decisions):
+            current_loudest = decision['loudest_track']
+            if current_loudest != prev_loudest and i > 0:
+                time_sec = decision['time']
+                db_levels = [f"{db:.1f}" for db in decision['db_levels']]
+                print(f"  {time_sec:.2f}s: Track{prev_loudest+1} -> Track{current_loudest+1}, dB=[{','.join(db_levels)}]")
+                transition_count += 1
+                if transition_count >= 20:
+                    break
+            prev_loudest = current_loudest
+        
         # Apply focus to each track and save
+        # IMPORTANT: Each output track contains ONLY its original input audio,
+        # muted when that specific track is not the focused one
         output_files = []
         for i, track_data in enumerate(tracks_data):
+            print(f"\nProcessing Track {i+1} (output will contain ONLY Track {i+1}'s original audio)")
             focused_audio = self._apply_focus(track_data, focus_decisions, i)
             
             # Show active audio percentage
@@ -359,10 +387,19 @@ class AudioFocusProcessor:
         return len(significant_tracks) >= 2
     
     def _apply_focus(self, track_data: Dict, focus_decisions: List[Dict], track_index: int) -> np.ndarray:
-        """Apply focus decisions to mute/unmute audio track"""
+        """Apply focus decisions to mute/unmute audio track
+        
+        CRITICAL: This always processes the SAME track's audio (track_index)
+        - audio = original audio from Track N (track_index)  
+        - focus_decisions = when Track N should be active vs muted
+        - output = Track N's audio, muted when Track N is not focused
+        """
         
         audio = track_data['audio'].copy()
         sample_rate = track_data['sample_rate']
+        
+        print(f"   _apply_focus: Processing track_index={track_index} (Track {track_index+1})")
+        print(f"   Input audio shape: {audio.shape}")
         
         # Start with completely muted track
         if len(audio.shape) > 1:  # Stereo
@@ -376,17 +413,26 @@ class AudioFocusProcessor:
         # Calculate samples per frame for processing
         # Note: track_index is 0-based here, but displayed as 1-based elsewhere
         
+        active_frame_count = 0
+        total_frame_count = len(focus_decisions)
+        
         for decision in focus_decisions:
             start_sample = decision['frame'] * samples_per_frame
             end_sample = min(start_sample + samples_per_frame, 
                            len(audio) if len(audio.shape) == 1 else audio.shape[1])
             
             if track_index in decision['active_tracks']:
-                # This track is focused - copy original audio with fade in
+                # This track is focused - copy THIS track's original audio
+                # IMPORTANT: We always copy from the SAME track's audio, never cross-contaminate
                 fade_samples = min(100, (end_sample - start_sample) // 4)  # Quick fade
+                active_frame_count += 1
+                
+                # Debug for first few frames
+                if decision['frame'] < 5:
+                    print(f"      Frame {decision['frame']}: Track {track_index+1} is ACTIVE, copying audio")
                 
                 if len(audio.shape) > 1:  # Stereo (channels, samples)
-                    # Copy the audio segment
+                    # Copy the audio segment from THIS track only
                     focused_audio[:, start_sample:end_sample] = audio[:, start_sample:end_sample]
                     
                     # Apply fade in if this is a transition
@@ -418,6 +464,22 @@ class AudioFocusProcessor:
                                     focused_audio[start_sample:start_sample + fade_samples] *= fade_in
             
             # If not in active tracks, segment remains muted (zeros)
+            else:
+                # Debug for first few frames  
+                if decision['frame'] < 5:
+                    print(f"      Frame {decision['frame']}: Track {track_index+1} is MUTED")
+        
+        # Debug: Check frame count consistency
+        expected_active_frames = sum(1 for d in focus_decisions if track_index in d['active_tracks'])
+        print(f"   Track {track_index+1}: Applied {active_frame_count} active frames, expected {expected_active_frames}")
+        frame_percentage = (active_frame_count / total_frame_count) * 100
+        print(f"   Track {track_index+1}: {frame_percentage:.1f}% active frames")
+        
+        # Debug: Check samples calculation
+        audio_samples = len(audio) if len(audio.shape) == 1 else audio.shape[1]
+        calculated_samples = total_frame_count * samples_per_frame
+        print(f"   Audio samples: {audio_samples}, Frame samples: {calculated_samples}")
+        print(f"   Samples per frame: {samples_per_frame}, Total decisions: {total_frame_count}")
         
         return focused_audio
     
