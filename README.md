@@ -17,15 +17,42 @@ This system analyzes multiple audio tracks (from video files or separate audio f
 
 ## Installation
 
-1. Install required dependencies:
+### Prerequisites
+Ensure FFmpeg is installed on your system:
+- **Windows**: Download from [ffmpeg.org](https://ffmpeg.org/download.html)
+- **macOS**: `brew install ffmpeg`
+- **Linux**: `sudo apt install ffmpeg` (Ubuntu/Debian)
+
+### Python Dependencies
+**Requirements**: Python 3.8 or higher
+
+1. Clone or download this repository
+2. (Recommended) Create a virtual environment:
+```bash
+python -m venv audio-focus-env
+# Windows:
+audio-focus-env\Scripts\activate
+# macOS/Linux:
+source audio-focus-env/bin/activate
+```
+
+3. Install dependencies using the requirements file:
+```bash
+pip install -r requirements.txt
+```
+
+**Alternative manual installation:**
 ```bash
 pip install ffmpeg-python librosa numpy scipy matplotlib soundfile
 ```
 
-2. Ensure FFmpeg is installed on your system:
-   - Windows: Download from [ffmpeg.org](https://ffmpeg.org/download.html)
-   - macOS: `brew install ffmpeg`
-   - Linux: `sudo apt install ffmpeg` (Ubuntu/Debian)
+### Verify Installation
+Test that everything is working:
+```bash
+python audio_focus.py --help
+```
+
+You should see the help message with all available options.
 
 ## Usage
 

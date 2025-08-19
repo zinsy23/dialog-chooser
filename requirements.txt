@@ -1,0 +1,12 @@
+# Audio Focus System Requirements
+# Core audio processing
+librosa>=0.10.0
+numpy>=1.20.0
+scipy>=1.7.0
+soundfile>=0.10.0
+
+# Video processing
+ffmpeg-python>=0.2.0
+
+# Optional visualization (for analysis)
+matplotlib>=3.5.0
