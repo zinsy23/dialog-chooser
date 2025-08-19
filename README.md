@@ -19,9 +19,31 @@ This system analyzes multiple audio tracks (from video files or separate audio f
 
 ### Prerequisites
 Ensure FFmpeg is installed on your system:
-- **Windows**: Download from [ffmpeg.org](https://ffmpeg.org/download.html)
-- **macOS**: `brew install ffmpeg`
-- **Linux**: `sudo apt install ffmpeg` (Ubuntu/Debian)
+
+**Windows (Recommended - using winget):**
+```bash
+winget install --id Gyan.FFmpeg --accept-source-agreements --accept-package-agreements
+```
+
+**Windows (Alternative methods):**
+- Download from [ffmpeg.org](https://ffmpeg.org/download.html)
+- Using Chocolatey: `choco install ffmpeg-full`
+
+**macOS:**
+```bash
+brew install ffmpeg
+```
+
+**Linux (Ubuntu/Debian):**
+```bash
+sudo apt install ffmpeg
+```
+
+**Verify FFmpeg Installation:**
+```bash
+ffmpeg -version
+```
+You should see FFmpeg version information if it's properly installed.
 
 ### Python Dependencies
 **Requirements**: Python 3.8 or higher
