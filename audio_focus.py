@@ -225,12 +225,18 @@ class AudioFocusProcessor:
             audio, sr = self.analyzer.load_audio(audio_file)
             if audio is not None:
                 db_levels = self.analyzer.calculate_db_levels(audio)
+                # Get original file format information to preserve it
+                file_info = sf.info(audio_file)
                 tracks_data.append({
                     'audio': audio,
                     'db_levels': db_levels,
                     'sample_rate': sr,
                     'track_num': i + 1,
-                    'output_prefix': output_prefix
+                    'output_prefix': output_prefix,
+                    'original_format': file_info.format,
+                    'original_subtype': file_info.subtype,
+                    'original_endian': file_info.endian,
+                    'source_file': audio_file
                 })
                 duration = len(audio) / sr if len(audio.shape) == 1 else audio.shape[1] / sr
                 print(f"Loaded track {i+1}: {duration:.2f}s")
@@ -425,7 +431,7 @@ class AudioFocusProcessor:
                 # We need to get the output_prefix from the calling context
                 # For now, we'll pass it through the track_data
                 output_prefix = track_data.get('output_prefix', 'focused')
-                return self._apply_focus_direct_write(audio, focus_decisions, track_index, sample_rate, output_prefix)
+                return self._apply_focus_direct_write(audio, focus_decisions, track_index, sample_rate, output_prefix, track_data)
         
         # Standard processing for smaller arrays
         # Start with completely muted track
@@ -555,7 +561,7 @@ class AudioFocusProcessor:
         print(f"   Chunked processing complete: {frames_processed} frames processed")
         return focused_audio
     
-    def _apply_focus_direct_write(self, audio: np.ndarray, focus_decisions: List[Dict], track_index: int, sample_rate: int, output_prefix: str) -> str:
+    def _apply_focus_direct_write(self, audio: np.ndarray, focus_decisions: List[Dict], track_index: int, sample_rate: int, output_prefix: str, track_data: Dict) -> str:
         """Stream directly to final output file using ffmpeg for large WAV files"""
         
         print(f"   Using streaming write for track {track_index+1} to avoid memory limits")
@@ -564,17 +570,23 @@ class AudioFocusProcessor:
         total_frames = len(focus_decisions)
         total_samples = audio.shape[1] if len(audio.shape) > 1 else len(audio)
         
-        # For large files, use scipy.io.wavfile to avoid soundfile WAV limitations
+        # For large files, use format-preserving approach
         if total_samples > 536870000:
-            print(f"   Large file detected - using scipy.io.wavfile for WAV output")
-            return self._write_large_wav_scipy(audio, focus_decisions, track_index, sample_rate, output_prefix)
+            print(f"   Large file detected - using format-preserving output")
+            return self._write_large_wav_scipy(audio, focus_decisions, track_index, sample_rate, output_prefix, track_data)
         
-        # Standard soundfile approach for smaller files
+        # Standard soundfile approach for smaller files - preserve format
+        orig_format = track_data.get('original_format', 'WAV')
+        orig_subtype = track_data.get('original_subtype', 'PCM_16')
+        orig_endian = track_data.get('original_endian', 'FILE')
+        
         final_output_file = f"{output_prefix}_track_{track_index+1}.wav"
         channels = audio.shape[0] if len(audio.shape) > 1 else 1
         
+        print(f"   Using original format: {orig_format}, subtype: {orig_subtype}")
+        
         with sf.SoundFile(final_output_file, 'w', samplerate=sample_rate, 
-                         channels=channels, subtype='PCM_16') as output_file:
+                         channels=channels, format=orig_format, subtype=orig_subtype, endian=orig_endian) as output_file:
             
             # Process in chunks and write directly to file
             chunk_size_frames = 5000  # Process 5k frames at a time
@@ -626,14 +638,53 @@ class AudioFocusProcessor:
         print(f"   Streaming write complete: {final_output_file}")
         return final_output_file
     
-    def _write_large_wav_scipy(self, audio: np.ndarray, focus_decisions: List[Dict], track_index: int, sample_rate: int, output_prefix: str) -> str:
-        """Write large WAV files using scipy.io.wavfile (no size limitations)"""
+    def _write_large_wav_scipy(self, audio: np.ndarray, focus_decisions: List[Dict], track_index: int, sample_rate: int, output_prefix: str, track_data: Dict) -> str:
+        """Write large files preserving original format using scipy or soundfile"""
         
-        print(f"   Using scipy.io.wavfile for large track {track_index+1}")
+        print(f"   Using format-preserving write for large track {track_index+1}")
+        
+        # Get original format settings
+        orig_format = track_data.get('original_format', 'WAV')
+        orig_subtype = track_data.get('original_subtype', 'PCM_32')
+        orig_endian = track_data.get('original_endian', 'FILE')
+        
+        print(f"   Preserving format: {orig_format}, subtype: {orig_subtype}")
         
         samples_per_frame = sample_rate // self.frame_rate
         total_frames = len(focus_decisions)
-        final_output_file = f"{output_prefix}_track_{track_index+1}.wav"
+        
+        # Use appropriate file extension based on format
+        ext_map = {
+            'WAV': '.wav',
+            'RF64': '.wav',      # RF64 uses .wav extension (large WAV files)
+            'WAVEX': '.wav',     # Microsoft extended WAV
+            'W64': '.w64',       # SoundFoundry WAVE 64
+            'FLAC': '.flac',     # Free Lossless Audio Codec
+            'AIFF': '.aiff',     # Apple/SGI format
+            'CAF': '.caf',       # Core Audio Format
+            'OGG': '.ogg',       # OGG Vorbis
+            'MP3': '.mp3',       # MPEG Audio (limited support)
+            'AU': '.au',         # Sun/NeXT format
+            'RAW': '.raw',       # Raw PCM data
+            'IRCAM': '.sf',      # Berkeley/IRCAM/CARL
+            'VOC': '.voc',       # Creative Labs
+            'AVR': '.avr',       # Audio Visual Research
+            'HTK': '.htk',       # HMM Tool Kit
+            'MAT4': '.mat',      # Matlab 4.2
+            'MAT5': '.mat',      # Matlab 5.0
+            'PAF': '.paf',       # Ensoniq PARIS
+            'PVF': '.pvf',       # Portable Voice Format
+            'SD2': '.sd2',       # Sound Designer II
+            'SDS': '.sds',       # Midi Sample Dump Standard
+            'SVX': '.svx',       # Amiga IFF format
+            'XI': '.xi',         # FastTracker 2
+            'WVE': '.wve',       # Psion Series 3
+            'NIST': '.wav',      # NIST Sphere (WAV variant)
+            'MPC2K': '.snd',     # Akai MPC 2k
+        }
+        
+        ext = ext_map.get(orig_format, '.wav')  # Default to .wav for unknown formats
+        final_output_file = f"{output_prefix}_track_{track_index+1}{ext}"
         
         # Build the focused audio array in manageable chunks
         output_chunks = []
@@ -689,18 +740,54 @@ class AudioFocusProcessor:
             focused_audio = np.concatenate(output_chunks)
             focused_audio_out = focused_audio
         
-        # Convert to int16 for WAV compatibility
-        if focused_audio_out.dtype != np.int16:
-            # Normalize and convert to int16
-            if focused_audio_out.dtype == np.float32 or focused_audio_out.dtype == np.float64:
-                # Assume float data is in [-1, 1] range
-                focused_audio_out = (focused_audio_out * 32767).astype(np.int16)
-            else:
-                focused_audio_out = focused_audio_out.astype(np.int16)
+        # Use soundfile to preserve original format and subtype
+        print(f"   Writing large file with original format: {focused_audio_out.shape}")
         
-        # Write using scipy.io.wavfile
-        print(f"   Writing large WAV file with scipy: {focused_audio_out.shape}")
-        wavfile.write(final_output_file, sample_rate, focused_audio_out)
+        # Special handling for lossy formats that might not preserve exact bit depth
+        lossy_formats = ['OGG', 'MP3']
+        if orig_format in lossy_formats:
+            print(f"   Note: {orig_format} is lossy - output quality may differ from input")
+        
+        try:
+            # Try soundfile with original format settings
+            sf.write(final_output_file, focused_audio_out, sample_rate, 
+                    format=orig_format, subtype=orig_subtype, endian=orig_endian)
+            
+        except Exception as e:
+            print(f"   Soundfile with original format failed ({e})")
+            
+            # Try format-specific fallbacks
+            if orig_format in ['WAV', 'RF64', 'WAVEX']:
+                print(f"   Trying scipy fallback for WAV-compatible format...")
+                # Fallback to scipy with format conversion for WAV-like formats
+                if focused_audio_out.dtype in [np.float32, np.float64]:
+                    # Convert float to appropriate integer type based on original subtype
+                    if orig_subtype == 'PCM_32':
+                        focused_audio_out = (focused_audio_out * (2**31 - 1)).astype(np.int32)
+                    elif orig_subtype == 'PCM_24':
+                        focused_audio_out = (focused_audio_out * (2**23 - 1)).astype(np.int32)
+                    else:  # Default to 16-bit
+                        focused_audio_out = (focused_audio_out * 32767).astype(np.int16)
+                
+                wavfile.write(final_output_file, sample_rate, focused_audio_out)
+                
+            else:
+                print(f"   Trying soundfile with default WAV format as final fallback...")
+                # For non-WAV formats, try with PCM_16 as fallback
+                try:
+                    # Convert to 16-bit for maximum compatibility
+                    if focused_audio_out.dtype in [np.float32, np.float64]:
+                        focused_audio_out = (focused_audio_out * 32767).astype(np.int16)
+                    
+                    wav_file = final_output_file.replace(ext, '.wav')
+                    sf.write(wav_file, focused_audio_out, sample_rate, 
+                            format='WAV', subtype='PCM_16')
+                    print(f"   Fallback successful: saved as WAV format")
+                    final_output_file = wav_file
+                    
+                except Exception as e2:
+                    print(f"   All fallbacks failed: {e2}")
+                    raise e  # Re-raise original error
         
         print(f"   Scipy write complete: {final_output_file}")
         return final_output_file
