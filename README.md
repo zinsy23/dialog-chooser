@@ -1,6 +1,6 @@
 # Audio Focus System
 
-An intelligent audio processing tool that automatically focuses on the loudest speaker at any given moment, eliminating microphone bleed and creating clean, focused audio tracks.
+An intelligent audio processing tool that automatically focuses on the loudest speaker at any given moment, eliminating microphone bleed and creating clean, focused audio tracks. No need to dial in on thresholds as it takes the loudest audio track and focuses that. It has some level of detecting when there's overlap from multiple speakers, which aren't microphone bleed related, and tries keeping those in.
 
 ## Overview
 
