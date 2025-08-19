@@ -1,2 +1,17 @@
+# Input files
 Dialog.mp4
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Output files
+focused_*.wav
+focused_*.mp4
 focused_report.txt
+temp_track_*.wav
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
