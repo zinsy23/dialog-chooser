@@ -15,3 +15,4 @@ temp_track_*.wav
 __pycache__/
 *.pyc
 *.pyo
+.DS_Store

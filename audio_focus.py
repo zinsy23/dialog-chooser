@@ -10,6 +10,7 @@ import argparse
 import numpy as np
 import librosa
 import soundfile as sf
+from scipy.io import wavfile
 import ffmpeg
 from pathlib import Path
 import json
@@ -91,12 +92,11 @@ class AudioAnalyzer:
     
     def calculate_db_levels(self, audio: np.ndarray) -> np.ndarray:
         """Calculate dB levels for audio frames"""
-        # Convert to mono for analysis if stereo
+        # Convert to mono for analysis if multi-channel
         if len(audio.shape) > 1:
-            if audio.shape[0] == 2:  # Stereo (channels, samples)
-                audio_mono = np.mean(audio, axis=0)
-            else:  # (samples, channels)
-                audio_mono = np.mean(audio, axis=1)
+            # librosa.load with mono=False returns (channels, samples) format consistently
+            # So audio.shape[0] = channels, audio.shape[1] = samples
+            audio_mono = np.mean(audio, axis=0)  # Average across channels, keep all samples
         else:
             audio_mono = audio
             
@@ -229,7 +229,8 @@ class AudioFocusProcessor:
                     'audio': audio,
                     'db_levels': db_levels,
                     'sample_rate': sr,
-                    'track_num': i + 1
+                    'track_num': i + 1,
+                    'output_prefix': output_prefix
                 })
                 duration = len(audio) / sr if len(audio.shape) == 1 else audio.shape[1] / sr
                 print(f"Loaded track {i+1}: {duration:.2f}s")
@@ -288,32 +289,47 @@ class AudioFocusProcessor:
         output_files = []
         for i, track_data in enumerate(tracks_data):
             print(f"\nProcessing Track {i+1} (output will contain ONLY Track {i+1}'s original audio)")
-            focused_audio = self._apply_focus(track_data, focus_decisions, i)
+            focused_result = self._apply_focus(track_data, focus_decisions, i)
             
-            # Show active audio percentage
-            total_samples = len(focused_audio) if len(focused_audio.shape) == 1 else focused_audio.shape[1]
-            if len(focused_audio.shape) > 1:
-                non_zero_samples = np.count_nonzero(np.any(focused_audio != 0, axis=0))
+            # Handle streaming vs in-memory result
+            if isinstance(focused_result, str):
+                # Streaming case - result is final filename
+                output_file = focused_result
+                
+                # Calculate active percentage from file
+                info = sf.info(output_file)
+                print(f"Track {i+1}: Streaming write complete - {info.frames} samples, {info.duration:.2f}s")
+                
             else:
-                non_zero_samples = np.count_nonzero(focused_audio)
+                # In-memory case - result is audio array
+                focused_audio = focused_result
+                
+                # Show active audio percentage
+                total_samples = len(focused_audio) if len(focused_audio.shape) == 1 else focused_audio.shape[1]
+                if len(focused_audio.shape) > 1:
+                    non_zero_samples = np.count_nonzero(np.any(focused_audio != 0, axis=0))
+                else:
+                    non_zero_samples = np.count_nonzero(focused_audio)
+                
+                active_percentage = (non_zero_samples / total_samples) * 100
+                print(f"Track {i+1}: {active_percentage:.1f}% active audio")
+                
+                # Save focused track
+                output_file = f"{output_prefix}_track_{i+1}.wav"
+                
+                # Ensure proper format for soundfile
+                # soundfile expects (samples, channels) format, but we have (channels, samples)
+                if len(focused_audio.shape) > 1:
+                    # Multi-channel - transpose to (samples, channels) format
+                    focused_audio_out = focused_audio.T
+                else:
+                    # Mono
+                    focused_audio_out = focused_audio
+                
+                sf.write(output_file, focused_audio_out, track_data['sample_rate'], subtype='PCM_16')
+                print(f"Saved focused track {i+1} to {output_file}")
             
-            active_percentage = (non_zero_samples / total_samples) * 100
-            print(f"Track {i+1}: {active_percentage:.1f}% active audio")
-            
-            # Save focused track
-            output_file = f"{output_prefix}_track_{i+1}.wav"
-            
-            # Ensure proper format for soundfile
-            if len(focused_audio.shape) > 1:
-                # Stereo - transpose to (samples, channels) format
-                focused_audio_out = focused_audio.T
-            else:
-                # Mono
-                focused_audio_out = focused_audio
-            
-            sf.write(output_file, focused_audio_out, track_data['sample_rate'], subtype='PCM_16')
             output_files.append(output_file)
-            print(f"Saved focused track {i+1} to {output_file}")
         
         # Generate focus report
         self._generate_focus_report(focus_decisions, tracks_data, f"{output_prefix}_report.txt")
@@ -395,14 +411,25 @@ class AudioFocusProcessor:
         - output = Track N's audio, muted when Track N is not focused
         """
         
-        audio = track_data['audio'].copy()
+        audio = track_data['audio']  # Don't copy immediately to save memory
         sample_rate = track_data['sample_rate']
         
         print(f"   _apply_focus: Processing track_index={track_index} (Track {track_index+1})")
         print(f"   Input audio shape: {audio.shape}")
         
+        # For very large arrays, avoid creating zeros_like which may hit memory limits
+        if len(audio.shape) > 1:
+            total_elements = audio.shape[0] * audio.shape[1]
+            if total_elements > 2**28:  # Lower threshold to catch the issue earlier
+                print(f"   Large array detected ({total_elements} elements), using direct file processing")
+                # We need to get the output_prefix from the calling context
+                # For now, we'll pass it through the track_data
+                output_prefix = track_data.get('output_prefix', 'focused')
+                return self._apply_focus_direct_write(audio, focus_decisions, track_index, sample_rate, output_prefix)
+        
+        # Standard processing for smaller arrays
         # Start with completely muted track
-        if len(audio.shape) > 1:  # Stereo
+        if len(audio.shape) > 1:  # Multi-channel
             focused_audio = np.zeros_like(audio)
         else:  # Mono
             focused_audio = np.zeros_like(audio)
@@ -482,6 +509,201 @@ class AudioFocusProcessor:
         print(f"   Samples per frame: {samples_per_frame}, Total decisions: {total_frame_count}")
         
         return focused_audio
+    
+    def _apply_focus_chunked(self, audio: np.ndarray, focus_decisions: List[Dict], track_index: int, sample_rate: int) -> np.ndarray:
+        """Memory-efficient chunked processing for large audio files"""
+        
+        print(f"   Using chunked processing for track {track_index+1}")
+        
+        # Process in chunks to avoid memory issues
+        chunk_size_frames = 10000  # Process 10k frames at a time
+        samples_per_frame = sample_rate // self.frame_rate
+        chunk_size_samples = chunk_size_frames * samples_per_frame
+        
+        # Initialize output array with the same shape as input
+        focused_audio = np.zeros_like(audio)
+        
+        total_frames = len(focus_decisions)
+        frames_processed = 0
+        
+        for chunk_start_frame in range(0, total_frames, chunk_size_frames):
+            chunk_end_frame = min(chunk_start_frame + chunk_size_frames, total_frames)
+            
+            # Calculate sample range for this chunk
+            start_sample = chunk_start_frame * samples_per_frame
+            end_sample = min(chunk_end_frame * samples_per_frame, audio.shape[1])
+            
+            print(f"   Processing chunk: frames {chunk_start_frame}-{chunk_end_frame}, samples {start_sample}-{end_sample}")
+            
+            # Process decisions for this chunk
+            for frame_idx in range(chunk_start_frame, chunk_end_frame):
+                if frame_idx >= len(focus_decisions):
+                    break
+                    
+                decision = focus_decisions[frame_idx]
+                frame_start_sample = decision['frame'] * samples_per_frame
+                frame_end_sample = min(frame_start_sample + samples_per_frame, audio.shape[1])
+                
+                if track_index in decision['active_tracks']:
+                    # Copy audio for this frame
+                    focused_audio[:, frame_start_sample:frame_end_sample] = audio[:, frame_start_sample:frame_end_sample]
+            
+            frames_processed = chunk_end_frame
+            if frames_processed % 50000 == 0:
+                print(f"   Processed {frames_processed}/{total_frames} frames ({frames_processed/total_frames*100:.1f}%)")
+        
+        print(f"   Chunked processing complete: {frames_processed} frames processed")
+        return focused_audio
+    
+    def _apply_focus_direct_write(self, audio: np.ndarray, focus_decisions: List[Dict], track_index: int, sample_rate: int, output_prefix: str) -> str:
+        """Stream directly to final output file using ffmpeg for large WAV files"""
+        
+        print(f"   Using streaming write for track {track_index+1} to avoid memory limits")
+        
+        samples_per_frame = sample_rate // self.frame_rate
+        total_frames = len(focus_decisions)
+        total_samples = audio.shape[1] if len(audio.shape) > 1 else len(audio)
+        
+        # For large files, use scipy.io.wavfile to avoid soundfile WAV limitations
+        if total_samples > 536870000:
+            print(f"   Large file detected - using scipy.io.wavfile for WAV output")
+            return self._write_large_wav_scipy(audio, focus_decisions, track_index, sample_rate, output_prefix)
+        
+        # Standard soundfile approach for smaller files
+        final_output_file = f"{output_prefix}_track_{track_index+1}.wav"
+        channels = audio.shape[0] if len(audio.shape) > 1 else 1
+        
+        with sf.SoundFile(final_output_file, 'w', samplerate=sample_rate, 
+                         channels=channels, subtype='PCM_16') as output_file:
+            
+            # Process in chunks and write directly to file
+            chunk_size_frames = 5000  # Process 5k frames at a time
+            
+            for chunk_start_frame in range(0, total_frames, chunk_size_frames):
+                chunk_end_frame = min(chunk_start_frame + chunk_size_frames, total_frames)
+                
+                # Calculate sample range for this chunk
+                chunk_start_sample = chunk_start_frame * samples_per_frame
+                chunk_end_sample = min(chunk_end_frame * samples_per_frame, audio.shape[1])
+                chunk_length = chunk_end_sample - chunk_start_sample
+                
+                # Create chunk buffer (much smaller)
+                if len(audio.shape) > 1:
+                    chunk_buffer = np.zeros((audio.shape[0], chunk_length), dtype=audio.dtype)
+                else:
+                    chunk_buffer = np.zeros(chunk_length, dtype=audio.dtype)
+                
+                # Fill in active parts of this chunk
+                for frame_idx in range(chunk_start_frame, chunk_end_frame):
+                    if frame_idx >= len(focus_decisions):
+                        break
+                        
+                    decision = focus_decisions[frame_idx]
+                    if track_index in decision['active_tracks']:
+                        # Calculate sample positions within this chunk
+                        frame_start_sample = decision['frame'] * samples_per_frame
+                        frame_end_sample = min(frame_start_sample + samples_per_frame, audio.shape[1])
+                        
+                        # Convert to chunk-relative positions
+                        chunk_rel_start = frame_start_sample - chunk_start_sample
+                        chunk_rel_end = frame_end_sample - chunk_start_sample
+                        
+                        # Copy audio data to buffer
+                        if len(audio.shape) > 1:
+                            chunk_buffer[:, chunk_rel_start:chunk_rel_end] = audio[:, frame_start_sample:frame_end_sample]
+                        else:
+                            chunk_buffer[chunk_rel_start:chunk_rel_end] = audio[frame_start_sample:frame_end_sample]
+                
+                # Write chunk to file (transpose if multi-channel for soundfile format)
+                if len(audio.shape) > 1:
+                    output_file.write(chunk_buffer.T)  # soundfile expects (samples, channels)
+                else:
+                    output_file.write(chunk_buffer)
+                
+                if chunk_end_frame % 25000 == 0:
+                    print(f"   Streamed {chunk_end_frame}/{total_frames} frames ({chunk_end_frame/total_frames*100:.1f}%)")
+        
+        print(f"   Streaming write complete: {final_output_file}")
+        return final_output_file
+    
+    def _write_large_wav_scipy(self, audio: np.ndarray, focus_decisions: List[Dict], track_index: int, sample_rate: int, output_prefix: str) -> str:
+        """Write large WAV files using scipy.io.wavfile (no size limitations)"""
+        
+        print(f"   Using scipy.io.wavfile for large track {track_index+1}")
+        
+        samples_per_frame = sample_rate // self.frame_rate
+        total_frames = len(focus_decisions)
+        final_output_file = f"{output_prefix}_track_{track_index+1}.wav"
+        
+        # Build the focused audio array in manageable chunks
+        output_chunks = []
+        chunk_size_frames = 5000  # Process 5k frames at a time
+        
+        for chunk_start_frame in range(0, total_frames, chunk_size_frames):
+            chunk_end_frame = min(chunk_start_frame + chunk_size_frames, total_frames)
+            
+            # Calculate sample range for this chunk
+            chunk_start_sample = chunk_start_frame * samples_per_frame
+            chunk_end_sample = min(chunk_end_frame * samples_per_frame, audio.shape[1])
+            chunk_length = chunk_end_sample - chunk_start_sample
+            
+            # Create chunk buffer
+            if len(audio.shape) > 1:
+                chunk_buffer = np.zeros((audio.shape[0], chunk_length), dtype=audio.dtype)
+            else:
+                chunk_buffer = np.zeros(chunk_length, dtype=audio.dtype)
+            
+            # Fill in active parts of this chunk
+            for frame_idx in range(chunk_start_frame, chunk_end_frame):
+                if frame_idx >= len(focus_decisions):
+                    break
+                    
+                decision = focus_decisions[frame_idx]
+                if track_index in decision['active_tracks']:
+                    # Calculate sample positions within this chunk
+                    frame_start_sample = decision['frame'] * samples_per_frame
+                    frame_end_sample = min(frame_start_sample + samples_per_frame, audio.shape[1])
+                    
+                    # Convert to chunk-relative positions
+                    chunk_rel_start = frame_start_sample - chunk_start_sample
+                    chunk_rel_end = frame_end_sample - chunk_start_sample
+                    
+                    # Copy audio data to buffer
+                    if len(audio.shape) > 1:
+                        chunk_buffer[:, chunk_rel_start:chunk_rel_end] = audio[:, frame_start_sample:frame_end_sample]
+                    else:
+                        chunk_buffer[chunk_rel_start:chunk_rel_end] = audio[frame_start_sample:frame_end_sample]
+            
+            output_chunks.append(chunk_buffer)
+            
+            if chunk_end_frame % 25000 == 0:
+                print(f"   Processed {chunk_end_frame}/{total_frames} frames ({chunk_end_frame/total_frames*100:.1f}%)")
+        
+        # Concatenate all chunks
+        print(f"   Concatenating {len(output_chunks)} chunks for scipy write...")
+        if len(audio.shape) > 1:
+            focused_audio = np.concatenate(output_chunks, axis=1)
+            # scipy expects (samples, channels) format
+            focused_audio_out = focused_audio.T
+        else:
+            focused_audio = np.concatenate(output_chunks)
+            focused_audio_out = focused_audio
+        
+        # Convert to int16 for WAV compatibility
+        if focused_audio_out.dtype != np.int16:
+            # Normalize and convert to int16
+            if focused_audio_out.dtype == np.float32 or focused_audio_out.dtype == np.float64:
+                # Assume float data is in [-1, 1] range
+                focused_audio_out = (focused_audio_out * 32767).astype(np.int16)
+            else:
+                focused_audio_out = focused_audio_out.astype(np.int16)
+        
+        # Write using scipy.io.wavfile
+        print(f"   Writing large WAV file with scipy: {focused_audio_out.shape}")
+        wavfile.write(final_output_file, sample_rate, focused_audio_out)
+        
+        print(f"   Scipy write complete: {final_output_file}")
+        return final_output_file
     
     def _generate_focus_report(self, focus_decisions: List[Dict], tracks_data: List[Dict], filename: str):
         """Generate a report of focus decisions for validation"""
